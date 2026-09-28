@@ -48,6 +48,11 @@ RSI_MAX_ENTRY = _float("RSI_MAX_ENTRY", 70)
 RSI_EXIT = _float("RSI_EXIT", 75)
 POLL_SECONDS = _int("POLL_SECONDS", 60)
 MIN_LLM_CONFIDENCE = _float("MIN_LLM_CONFIDENCE", 0.6)
+# Sell when the fast EMA crosses back below the slow one. false = only stop-loss,
+# take-profit and RSI exits, which lets winning trades run longer.
+EXIT_ON_CROSS = _bool("EXIT_ON_CROSS", "true")
+# Only buy when price is above this long EMA (the bigger trend is up). 0 = off.
+TREND_EMA = _int("TREND_EMA", 0)
 
 # Risk ("medium" defaults)
 MAX_OPEN_POSITIONS = _int("MAX_OPEN_POSITIONS", 3)

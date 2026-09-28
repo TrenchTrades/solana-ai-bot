@@ -304,7 +304,8 @@ class Bot:
         data = {}
         for sym, info in self.tokens.items():
             try:
-                data[sym] = (fetch_candles(info["coinbase"], C.CANDLE_GRANULARITY),
+                chunks = 1 + C.TREND_EMA // 150
+                data[sym] = (fetch_candles(info["coinbase"], C.CANDLE_GRANULARITY, chunks),
                              fetch_price(info["coinbase"]))
             except Exception as e:
                 log.warning("%s: market data failed (%s)", sym, e)
@@ -324,7 +325,7 @@ class Bot:
 
     def evaluate(self, sym, candles, price, equity, prices):
         s = self.state
-        if len(candles) < max(C.EMA_SLOW, C.RSI_PERIOD) * 3:
+        if len(candles) < max(C.EMA_SLOW * 3, C.RSI_PERIOD * 3, C.TREND_EMA):
             log.warning("%s: not enough candle data (%d)", sym, len(candles))
             return
         closes = [c["close"] for c in candles]
@@ -333,6 +334,9 @@ class Bot:
         cid = candles[-1]["time"]
         cross_up = ef[-2] <= es[-2] and ef[-1] > es[-1]
         cross_dn = ef[-2] >= es[-2] and ef[-1] < es[-1]
+        trend_ok = True
+        if C.TREND_EMA:
+            trend_ok = closes[-1] > ema(closes, C.TREND_EMA)[-1]
         pos = s["positions"].get(sym)
         log.info("  %-4s %.6g | EMA%d %.6g EMA%d %.6g | RSI %.1f | %s", sym, price,
                  C.EMA_FAST, ef[-1], C.EMA_SLOW, es[-1], r,
@@ -346,10 +350,10 @@ class Bot:
             if chg >= C.TAKE_PROFIT_PCT:
                 self.close_position(sym, price, f"take_profit {chg:.2f}%", "bypassed", forced=True)
                 return
-            if (cross_dn or r >= C.RSI_EXIT) and s["last_signal_candle"].get(sym) != cid:
+            if ((C.EXIT_ON_CROSS and cross_dn) or r >= C.RSI_EXIT) and s["last_signal_candle"].get(sym) != cid:
                 s["last_signal_candle"][sym] = cid
                 save_state(s)
-                why = "ema_cross_down" if cross_dn else f"rsi_{r:.0f}"
+                why = f"rsi_{r:.0f}" if r >= C.RSI_EXIT else "ema_cross_down"
                 v = review_signal(f"SELL {sym}", self.snapshot(sym, candles, ef, es, r, price, prices))
                 log.info("Claude on SELL %s: %s (%.2f) — %s", sym, v["decision"], v["confidence"], v["reason"])
                 if v["approve"] or v["error"]:
@@ -359,7 +363,7 @@ class Bot:
                                 f"{v['confidence']:.2f}): {v['reason']}")
             return
 
-        if not (cross_up and r < C.RSI_MAX_ENTRY) or s["last_signal_candle"].get(sym) == cid:
+        if not (cross_up and r < C.RSI_MAX_ENTRY and trend_ok) or s["last_signal_candle"].get(sym) == cid:
             return
         s["last_signal_candle"][sym] = cid
         save_state(s)

@@ -6,6 +6,8 @@ Backtester: replays the bot's exact rules over past price data. Trades nothing.
   python backtest.py --days 180            longer history
   python backtest.py --sweep               compare stop-loss / take-profit combinations
   python backtest.py --start-usdc 50 --max-trade 50
+  python backtest.py --compare             compare strategy variants, split into two halves
+  python backtest.py --no-cross-exit --trend-ema 200   test a specific variant
 
 Notes
 - Claude's approve/veto step is NOT simulated (it would cost API calls, and Claude may
@@ -107,26 +109,30 @@ class Params:
     ema_fast: int
     ema_slow: int
     rsi_period: int
+    exit_on_cross: bool = True
+    trend_ema: int = 0
 
 
-def prepare(raw, p):
+def prepare(raw, p, trend_len=200):
     out = {}
     for sym, d in raw.items():
         c = d["c"]
         out[sym] = {**d, "ef": ema(c, p.ema_fast), "es": ema(c, p.ema_slow),
+                    "et": ema(c, p.trend_ema or trend_len),
                     "r": rsi_series(c, p.rsi_period),
                     "idx": {t: i for i, t in enumerate(d["t"])}}
     return out
 
 
-def simulate(data, p):
+def simulate(data, p, t_from=None, t_to=None):
     usdc = p.start_usdc
     positions, trades, curve = {}, [], []
     last_close = {}
     day, trades_today, pnl_today, day_start_eq = None, 0, 0.0, p.start_usdc
     skipped = {"max_open": 0, "daily_trades": 0, "daily_loss": 0, "too_small": 0}
-    warm = max(p.ema_slow, p.rsi_period) * 3
+    warm = max(p.ema_slow * 3, p.rsi_period * 3, p.trend_ema)
     all_ts = sorted(set().union(*[d["t"] for d in data.values()]))
+    all_ts = [t for t in all_ts if (t_from is None or t >= t_from) and (t_to is None or t < t_to)]
 
     def equity():
         return usdc + sum(pos["amount"] * last_close.get(s, pos["entry"]) for s, pos in positions.items())
@@ -166,13 +172,15 @@ def simulate(data, p):
                     close(sym, min(sl_px, d["o"][i]), ts, "stop_loss")
                 elif d["h"][i] >= tp_px:
                     close(sym, max(tp_px, d["o"][i]), ts, "take_profit")
-                elif cross_dn:
+                elif p.exit_on_cross and cross_dn:
                     close(sym, d["c"][i], ts, "ema_cross_down")
                 elif r >= p.rsi_exit:
                     close(sym, d["c"][i], ts, "rsi_exit")
                 continue
 
             if not (cross_up and r < p.rsi_max_entry):
+                continue
+            if p.trend_ema and d["c"][i] <= d["et"][i]:
                 continue
             if len(positions) >= p.max_open:
                 skipped["max_open"] += 1
@@ -226,11 +234,13 @@ def stats(trades, curve, start):
     }
 
 
-def buy_and_hold(data, warm):
+def buy_and_hold(data, warm, t_from=None, t_to=None):
     rets = []
     for sym, d in data.items():
-        if len(d["c"]) > warm:
-            rets.append((d["c"][-1] / d["c"][warm] - 1) * 100)
+        idx = [i for i, t in enumerate(d["t"]) if i >= warm and (t_from is None or t >= t_from)
+               and (t_to is None or t < t_to)]
+        if len(idx) > 1:
+            rets.append((d["c"][idx[-1]] / d["c"][idx[0]] - 1) * 100)
     return sum(rets) / len(rets) if rets else 0.0
 
 
@@ -244,6 +254,8 @@ def report(trades, curve, skipped, p, data, days):
     print(f" Tokens: {', '.join(data)}")
     print(f" Settings: SL {p.sl}% | TP {p.tp}% | {p.position_pct * 100:.0f}% per trade, cap ${p.max_trade:.0f} "
           f"| max {p.max_open} open | costs {p.cost_pct}%/side + ${p.fixed_fee}/swap")
+    print(f" Strategy: exit on EMA cross-down {'ON' if p.exit_on_cross else 'OFF'} | trend filter "
+          f"{'EMA' + str(p.trend_ema) if p.trend_ema else 'OFF'}")
     print("=" * 60)
     print(f" Start balance      ${p.start_usdc:,.2f}")
     print(f" End balance        ${s['final']:,.2f}   ({s['return_pct']:+.2f}%)")
@@ -309,6 +321,38 @@ def sweep(data, p, days):
     print("=" * 72)
 
 
+def compare(data, p, days):
+    all_ts = sorted(set().union(*[d["t"] for d in data.values()]))
+    mid = all_ts[len(all_ts) // 2]
+    variants = [
+        ("Current (cross exit, no trend)", dict(exit_on_cross=True, trend_ema=0)),
+        ("No cross exit", dict(exit_on_cross=False, trend_ema=0)),
+        ("Trend filter EMA200", dict(exit_on_cross=True, trend_ema=200)),
+        ("Trend EMA200 + no cross exit", dict(exit_on_cross=False, trend_ema=200)),
+    ]
+    print("\n" + "=" * 86)
+    print(f" STRATEGY COMPARISON  ({days} days, {C.CANDLE_GRANULARITY // 60}-min candles, "
+          f"SL {p.sl}% / TP {p.tp}%, costs {p.cost_pct}%/side)")
+    print(" Each variant also runs on the 1st and 2nd half separately: a real edge should")
+    print(" hold up in both halves, not just one.")
+    print("=" * 86)
+    print(f" {'Variant':<32} {'Return':>8} {'MaxDD':>7} {'Trades':>7} {'PF':>5} {'1st half':>9} {'2nd half':>9}")
+    for name, kw in variants:
+        q = replace(p, **kw)
+        res = []
+        for a, b in ((None, None), (None, mid), (mid, None)):
+            trades, curve, _ = simulate(data, q, a, b)
+            res.append(stats(trades, curve, q.start_usdc))
+        full, h1, h2 = res
+        pf = "∞" if full["profit_factor"] == float("inf") else f"{full['profit_factor']:.2f}"
+        print(f" {name:<32} {full['return_pct']:>+7.1f}% {full['max_dd']:>6.1f}% {full['trades']:>7} {pf:>5} "
+              f"{h1['return_pct']:>+8.1f}% {h2['return_pct']:>+8.1f}%")
+    warm = max(p.ema_slow, p.rsi_period) * 3
+    print(f" {'Buy & hold (equal weight)':<32} {buy_and_hold(data, warm):>+7.1f}% {'':>7} {'':>7} {'':>5} "
+          f"{buy_and_hold(data, warm, None, mid):>+8.1f}% {buy_and_hold(data, warm, mid, None):>+8.1f}%")
+    print("=" * 86)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Backtest the trading bot's strategy")
     ap.add_argument("--days", type=int, default=90)
@@ -322,6 +366,9 @@ def main():
     ap.add_argument("--cost-pct", type=float, default=0.25, help="swap fee + slippage per side, percent")
     ap.add_argument("--fixed-fee", type=float, default=0.05, help="network/priority fee per swap, USD")
     ap.add_argument("--sweep", action="store_true")
+    ap.add_argument("--compare", action="store_true")
+    ap.add_argument("--no-cross-exit", action="store_true", default=not C.EXIT_ON_CROSS)
+    ap.add_argument("--trend-ema", type=int, default=C.TREND_EMA)
     args = ap.parse_args()
 
     p = Params(start_usdc=args.start_usdc, max_trade=args.max_trade, position_pct=args.position_pct,
@@ -329,7 +376,8 @@ def main():
                rsi_exit=C.RSI_EXIT, max_trades_day=C.MAX_TRADES_PER_DAY,
                max_daily_loss_pct=C.MAX_DAILY_LOSS_PCT, cost_pct=args.cost_pct,
                fixed_fee=args.fixed_fee, ema_fast=C.EMA_FAST, ema_slow=C.EMA_SLOW,
-               rsi_period=C.RSI_PERIOD)
+               rsi_period=C.RSI_PERIOD, exit_on_cross=not args.no_cross_exit,
+               trend_ema=args.trend_ema)
 
     print(f"Loading {args.days} days of price history (cached for 6 hours after the first run)...")
     raw = {}
@@ -346,7 +394,9 @@ def main():
         raise SystemExit("No price data downloaded.")
 
     data = prepare(raw, p)
-    if args.sweep:
+    if args.compare:
+        compare(data, p, args.days)
+    elif args.sweep:
         sweep(data, p, args.days)
     else:
         trades, curve, skipped = simulate(data, p)
