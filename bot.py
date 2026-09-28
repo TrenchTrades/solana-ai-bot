@@ -27,6 +27,7 @@ from indicators import ema, rsi
 from jupiter import Jupiter
 from llm import review_signal
 from market_data import fetch_candles, fetch_price, token_decimals
+import notify
 
 log = logging.getLogger("bot")
 
@@ -151,6 +152,11 @@ class Bot:
     def roll_day(self, equity):
         s = self.state
         if s["day"] != today():
+            if s["day"]:
+                open_pos = ", ".join(s["positions"]) or "none"
+                notify.send(f"📊 Daily summary {s['day']} (UTC)\n"
+                            f"Trades: {s['trades_today']}\nRealized PnL: {s['pnl_today']:+.2f} USDC\n"
+                            f"Balance now: ~${equity:,.2f}\nOpen positions: {open_pos}")
             s.update(day=today(), trades_today=0, pnl_today=0.0, day_start_equity=equity)
             save_state(s)
 
@@ -174,6 +180,9 @@ class Bot:
         if dev > max_dev:
             log.warning("Blocked %s %s: Jupiter %.6f is %.2f%% off Coinbase %.6f (limit %.2f%%)",
                         side, sym, price, dev, ref_price, max_dev)
+            notify.send(f"⛔ {side} {sym} blocked: Jupiter price {dev:.2f}% off Coinbase "
+                        f"(limit {max_dev:.2f}%). Will retry on the next signal.",
+                        key=f"block-{sym}", every=1800)
             return None
 
         if self.wallet:
@@ -190,9 +199,12 @@ class Bot:
             tx = "paper"
         return amount, usdc, price, tx
 
-    def open_position(self, sym, ref_price, equity, verdict):
+    def open_position(self, sym, ref_price, equity, v):
+        verdict = f"{v['decision']} {v['confidence']:.2f}"
         if self.wallet and self.wallet.sol_balance() < C.SOL_FEE_RESERVE:
             log.warning("SOL balance below fee reserve %.3f — add SOL for fees", C.SOL_FEE_RESERVE)
+            notify.send(f"⚠️ Wallet SOL is below {C.SOL_FEE_RESERVE} — add SOL for fees or trades will stop.",
+                        key="fee-reserve", every=3600)
             return
         usdc_bal = self.usdc_balance()
         size = round(min(C.MAX_TRADE_USD, equity * C.POSITION_PCT, usdc_bal), 2)
@@ -212,6 +224,12 @@ class Bot:
                    "reason": "ema_cross_up", "amount": f"{amount:.6f}", "usdc": f"{usdc:.2f}",
                    "price": f"{price:.6f}", "pnl_usd": "", "llm": verdict, "tx": tx})
         log.info("BOUGHT %.4f %s for %.2f USDC @ %.6f (%s)", amount, sym, usdc, price, tx)
+        notify.send(f"🟢 BUY {sym} [{self.mode}]\n"
+                    f"${usdc:.2f} → {amount:.4f} {sym} @ {price:.6g}\n"
+                    f"Stop-loss {price * (1 - C.STOP_LOSS_PCT / 100):.6g} | "
+                    f"Take-profit {price * (1 + C.TAKE_PROFIT_PCT / 100):.6g}\n"
+                    f"Claude ({v['confidence']:.2f}): {v['reason']}\n"
+                    f"Open: {', '.join(self.state['positions'])}" + notify.tx_link(tx))
 
     def close_position(self, sym, ref_price, reason, verdict="", forced=False):
         pos = self.state["positions"][sym]
@@ -223,6 +241,8 @@ class Bot:
             amount = min(amount, bal)
             if amount <= 0:
                 log.error("Wallet holds no %s to sell (was it moved?). Clearing the position.", sym)
+                notify.send(f"⚠️ Wanted to sell {sym} but the wallet holds none (moved manually?). "
+                            f"Position cleared.")
                 del self.state["positions"][sym]
                 save_state(self.state)
                 return
@@ -239,6 +259,14 @@ class Bot:
                    "reason": reason, "amount": f"{sold:.6f}", "usdc": f"{usdc:.2f}",
                    "price": f"{price:.6f}", "pnl_usd": f"{pnl:.2f}", "llm": verdict, "tx": tx})
         log.info("SOLD %.4f %s for %.2f USDC @ %.6f | PnL %+.2f (%s)", sold, sym, usdc, price, pnl, reason)
+        pct = (price / pos["entry_price"] - 1) * 100
+        icon = "✅" if pnl >= 0 else "🔻"
+        notify.send(f"{icon} SELL {sym} [{self.mode}] — {reason}\n"
+                    f"{sold:.4f} {sym} → ${usdc:.2f} @ {price:.6g}\n"
+                    f"PnL {pnl:+.2f} USDC ({pct:+.2f}%)\n"
+                    f"Today: {self.state['trades_today']} trades, {self.state['pnl_today']:+.2f} USDC"
+                    + (f"\nClaude: {verdict}" if verdict and verdict != "bypassed" else "")
+                    + notify.tx_link(tx))
 
     # ---------- decision loop
     def snapshot(self, sym, candles, ef, es, r, price, prices):
@@ -290,8 +318,9 @@ class Bot:
         for sym, (candles, price) in data.items():
             try:
                 self.evaluate(sym, candles, price, equity, prices)
-            except Exception:
+            except Exception as e:
                 log.exception("%s: evaluation failed", sym)
+                notify.send(f"⚠️ {sym} error: {e}", key=f"eval-{sym}", every=1800)
 
     def evaluate(self, sym, candles, price, equity, prices):
         s = self.state
@@ -325,6 +354,9 @@ class Bot:
                 log.info("Claude on SELL %s: %s (%.2f) — %s", sym, v["decision"], v["confidence"], v["reason"])
                 if v["approve"] or v["error"]:
                     self.close_position(sym, price, why, f"{v['decision']} {v['confidence']:.2f}")
+                elif C.NOTIFY_VETOES:
+                    notify.send(f"⚪ Claude kept {sym} open (skipped sell signal {why}, "
+                                f"{v['confidence']:.2f}): {v['reason']}")
             return
 
         if not (cross_up and r < C.RSI_MAX_ENTRY) or s["last_signal_candle"].get(sym) == cid:
@@ -344,7 +376,9 @@ class Bot:
         v = review_signal(f"BUY {sym}", self.snapshot(sym, candles, ef, es, r, price, prices))
         log.info("Claude on BUY %s: %s (%.2f) — %s", sym, v["decision"], v["confidence"], v["reason"])
         if v["approve"]:
-            self.open_position(sym, price, equity, f"{v['decision']} {v['confidence']:.2f}")
+            self.open_position(sym, price, equity, v)
+        elif C.NOTIFY_VETOES:
+            notify.send(f"⚪ Claude vetoed BUY {sym} ({v['decision']} {v['confidence']:.2f}): {v['reason']}")
 
     def status(self):
         prices = {}
@@ -398,13 +432,17 @@ def main():
         time.sleep(10)
     else:
         log.info("PAPER mode — real prices and quotes, no transactions sent.")
+    notify.send(f"🤖 Trading bot started [{bot.mode}]\nWatching: {', '.join(bot.tokens)}\n"
+                f"Max {C.MAX_OPEN_POSITIONS} positions, ${C.MAX_TRADE_USD:.2f} cap per trade\n"
+                f"Open now: {', '.join(bot.state['positions']) or 'none'}")
 
     try:
         while True:
             try:
                 bot.tick()
-            except Exception:
+            except Exception as e:
                 log.exception("Tick failed; will retry next cycle")
+                notify.send(f"⚠️ Bot error (it keeps retrying): {e}", key="tick", every=1800)
             if args.once:
                 break
             time.sleep(C.POLL_SECONDS)

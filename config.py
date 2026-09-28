@@ -63,3 +63,8 @@ SOL_FEE_RESERVE = _float("SOL_FEE_RESERVE", 0.02)
 MAX_PRIORITY_FEE_LAMPORTS = _int("MAX_PRIORITY_FEE_LAMPORTS", 1_000_000)
 
 PAPER_START_USDC = _float("PAPER_START_USDC", 1000)
+
+# Telegram alerts (optional; leave blank to disable)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+NOTIFY_VETOES = _bool("NOTIFY_VETOES", "true")
