@@ -7,9 +7,9 @@ import config as C
 
 log = logging.getLogger("llm")
 
-SYSTEM = """You review trade signals for an automated bot that trades SOL against USDC on Solana.
-A rule-based strategy (EMA crossover + RSI) has produced the signal below. Act as a skeptical
-second opinion. APPROVE only if the market data genuinely supports the signal. VETO if it looks
+SYSTEM = """You review trade signals for an automated bot that trades Solana tokens against USDC.
+A rule-based strategy (EMA crossover + RSI) has produced the signal below for one token. The bot's
+other open positions are listed for context. Act as a skeptical second opinion. APPROVE only if the market data genuinely supports the signal. VETO if it looks
 like sideways chop, a weak or likely-failed crossover, an overextended move, abnormal volatility,
 or anything else that makes the trade poor. You cannot suggest other trades or sizes.
 
