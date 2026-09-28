@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# Installs the Solana AI bot as a 24/7 service on Ubuntu (e.g. a DigitalOcean droplet).
+# Usage (from the folder you uploaded):  sudo bash setup.sh
+# Safe to re-run after updating the code: state.json, trades.csv and bot.log are kept.
+set -euo pipefail
+
+APP_DIR=/opt/solana-ai-bot
+SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
+FILES="bot.py config.py indicators.py jupiter.py llm.py market_data.py wallet.py requirements.txt"
+
+if [[ $EUID -ne 0 ]]; then echo "Please run with sudo: sudo bash setup.sh"; exit 1; fi
+if [[ ! -f "$SRC_DIR/.env" && ! -f "$APP_DIR/.env" ]]; then
+  echo "No .env found. Copy .env.example to .env and fill it in first."; exit 1
+fi
+
+echo "==> Installing Python"
+apt-get update -y -q
+apt-get install -y -q python3 python3-venv python3-pip
+
+echo "==> Creating service user 'solbot'"
+id -u solbot &>/dev/null || useradd --system --home "$APP_DIR" --shell /usr/sbin/nologin solbot
+mkdir -p "$APP_DIR"
+
+echo "==> Copying code to $APP_DIR"
+for f in $FILES; do install -m 644 "$SRC_DIR/$f" "$APP_DIR/$f"; done
+if [[ -f "$SRC_DIR/.env" && "$SRC_DIR" != "$APP_DIR" ]]; then
+  install -m 600 "$SRC_DIR/.env" "$APP_DIR/.env"
+fi
+
+echo "==> Installing Python packages"
+[[ -d "$APP_DIR/venv" ]] || python3 -m venv "$APP_DIR/venv"
+"$APP_DIR/venv/bin/pip" install -q --upgrade pip
+"$APP_DIR/venv/bin/pip" install -q -r "$APP_DIR/requirements.txt"
+chown -R solbot:solbot "$APP_DIR"
+chmod 600 "$APP_DIR/.env"
+
+echo "==> Creating systemd service"
+cat > /etc/systemd/system/solbot.service << 'EOF'
+[Unit]
+Description=Solana AI trading bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=solbot
+WorkingDirectory=/opt/solana-ai-bot
+ExecStart=/opt/solana-ai-bot/venv/bin/python -u bot.py
+Restart=always
+RestartSec=15
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+echo "==> Clock sync + firewall (SSH only; the bot needs no open ports)"
+timedatectl set-ntp true || true
+ufw allow OpenSSH >/dev/null && ufw --force enable >/dev/null
+
+echo "==> Checking wallet, RPC and prices"
+if ! sudo -u solbot bash -c "cd $APP_DIR && ./venv/bin/python bot.py --status"; then
+  echo "Status check failed — fix .env ($APP_DIR/.env) and re-run. Service NOT started."; exit 1
+fi
+
+systemctl daemon-reload
+systemctl enable solbot >/dev/null
+systemctl restart solbot
+
+cat << EOF
+
+Bot is running and will auto-start on reboot and restart after crashes.
+
+  Live logs:     journalctl -u solbot -f
+  Status:        sudo -u solbot bash -c "cd $APP_DIR && ./venv/bin/python bot.py --status"
+  Trade history: cat $APP_DIR/trades.csv
+  Pause:         sudo touch $APP_DIR/STOP     (resume: sudo rm $APP_DIR/STOP)
+  Stop fully:    sudo systemctl stop solbot
+  Edit settings: sudo nano $APP_DIR/.env  then  sudo systemctl restart solbot
+
+IMPORTANT: your private key is now in $APP_DIR/.env (readable only by the bot).
+Delete the uploaded copy:  rm -rf "$SRC_DIR"
+EOF
